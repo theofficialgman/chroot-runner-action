@@ -1,0 +1,283 @@
+name: 'chroot runner'
+description: 'Composite action to run commands within a chrooted environment'
+inputs:
+  base_image:
+    description: 'System base image'
+    required: true
+    default: 'raspios_lite:latest'
+  image_additional_mb:
+    description: 'Additional MB for image'
+    required: false
+    default: 0
+  bind_mount_repository:
+    description: 'Bind mount repository instead of copying it'
+    required: false
+    default: 'no'
+  cpu_info:
+    description: 'Path to cpu info file to be mounted on /proc/cpuinfo'
+    required: false
+    default: ''
+  commands:
+    description: 'Commands to run in the image, executed with /bin/sh'
+    required: true
+    default: 'uname -a'
+  copy_artifact_path:
+    description: 'Paths of artifacts to copy from inside the image on completion'
+    required: false
+  copy_artifact_dest:
+    description: 'Where to copy artifacts on completion'
+    required: false
+    default: '.'
+  copy_repository_path:
+    description: 'Where to copy repository path before running commands'
+    required: false
+    default: ''
+  optimize_image:
+    description: 'Optimize image during final cleanup'
+    required: false
+    default: 'yes'
+  use_systemd_nspawn:
+    description: 'Use systemd-nspawn instead of chroot'
+    required: false
+    default: 'no'
+  systemd_nspawn_options:
+    description: 'Options passed to systemd-nspawn, e.g. -E CI=${CI}'
+    required: false
+    default: ''
+  bootpartition:
+    description: 'Partition number for boot (/boot), empty means none'
+    required: false
+    default: '1'
+  rootpartition:
+    description: 'Partition number for root (/)'
+    required: false
+    default: '2'
+  shell:
+    description: 'Path to shell to run the commands with'
+    required: false
+    default: '/bin/sh'
+  shell_package:
+    description: 'The shell package to install, if different from shell'
+    required: false
+    default: ''
+  exit_on_fail:
+    description: 'Exit immediately if a command exits with a non-zero status'
+    required: false
+    default: 'yes'
+  debug:
+    description: 'Display commands as they are executed'
+    required: false
+    default: 'yes'
+  import_github_env:
+    description: 'Imports $GITHUB_ENV variables into the image environment'
+    required: false
+    default: 'no'
+  export_github_env:
+    description: 'Exports $GITHUB_ENV from the image environment to subsequent tasks'
+    required: false
+    default: 'no'
+  enable_image_caching:
+    description: 'Cache images using actions/cache'
+    required: false
+    default: 'yes'
+  install_standard_packages:
+    description: 'Install debian base standard packages'
+    required: false
+    default: 'no'
+outputs:
+  image:
+    description: "Path to image"
+    value: ${{ steps.download_image.outputs.image }}
+runs:
+  using: "composite"
+  steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y parted wget dosfstools zip
+      shell: bash
+    - name: Restore base image (if available)
+      id: cache_restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/arm-runner
+        key: ${{ inputs.base_image }}
+        restore-keys: ${{ inputs.base_image }}
+    - name: Download base image
+      run: |
+        sudo rm -rf ${{ runner.temp }}/arm-runner/*
+        sync
+        bash ${{ github.action_path }}/download_image.sh ${{ inputs.base_image }}
+        ls -l ${{ runner.temp }}/arm-runner
+        sync
+      shell: bash
+      id: download_image
+    - name: Save base image (if needed)
+      id: cache_save
+      if: steps.cache_restore.outputs.cache-hit != 'true' && inputs.enable_image_caching == 'yes'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/arm-runner
+        key: ${{ inputs.base_image }}
+    - name: Mount and optionally resize image
+      run: |
+        sudo --preserve-env=GITHUB_OUTPUT bash ${{ github.action_path }}/mount_image.sh ${{ steps.download_image.outputs.image }} ${{ inputs.image_additional_mb }} ${{ inputs.use_systemd_nspawn }} ${{ inputs.rootpartition }} ${{ inputs.bootpartition }}
+      shell: bash
+      id: mount_image
+    - name: Mount CPU info
+      if: ${{ inputs.cpu_info != '' }}
+      run: |
+        if [ -e ${{ github.workspace }}/${{ inputs.cpu_info }} ]; then
+          cpu_info_path=${{ github.workspace }}/${{ inputs.cpu_info }}
+        else
+          cpu_info_path=${{ github.action_path }}/${{ inputs.cpu_info }}
+        fi
+        sudo mount --bind ${cpu_info_path} ${{ steps.mount_image.outputs.mount }}/proc/cpuinfo
+      shell: bash
+    - name: Run commands
+      run: |
+        case "${{ inputs.debug }}" in
+        yes|true)
+            debug='x'
+            set -x
+        ;;
+        no|false)
+            debug=''
+        ;;
+        esac
+        repository_path=${{ inputs.copy_repository_path }}
+        if [ "${repository_path}x" = "x" ]; then
+            repository_name=`basename ${{ github.workspace }}`
+            repository_path=/${repository_name}
+        fi
+        case "${{ inputs.exit_on_fail }}" in
+        yes|true)
+            exit_on_fail='e'
+        ;;
+        no|false)
+            exit_on_fail=''
+        ;;
+        esac
+
+        case ${{ inputs.install_standard_packages }} in
+        yes|true)
+            sudo chroot ${{ steps.mount_image.outputs.mount }} tasksel install --new-install standard
+            sudo chroot ${{ steps.mount_image.outputs.mount }} apt update
+            sudo chroot ${{ steps.mount_image.outputs.mount }} apt purge --autoremove initramfs-tools -y
+            sudo chroot ${{ steps.mount_image.outputs.mount }} apt install task-lxde-desktop -y
+        ;;
+        esac
+
+        shell_with_opts="${{ inputs.shell }}"
+        shell=${shell_with_opts%% *}
+        if [ "${shell}" != "${shell_with_opts}" ]; then
+            shell_opts=${shell_with_opts#* }
+        else
+            shell_opts=""
+        fi
+        shell_package=${{ inputs.shell_package }}
+        [ -x ${{ steps.mount_image.outputs.mount }}/${shell} ] || \
+        shell_path=$(sudo chroot ${{ steps.mount_image.outputs.mount }} /bin/sh -c "command -v ${shell}") || \
+        case ${shell} in
+        bash|sh)
+            :
+        ;;
+        *)
+            sudo chroot ${{ steps.mount_image.outputs.mount }} sudo apt-get install -y ${shell_package:-${shell##*/}}
+        ;;
+        esac
+        shell_path=${shell_path:-$(sudo chroot ${{ steps.mount_image.outputs.mount }} /bin/sh -c "command -v ${shell}")}
+        sudo mkdir -p $(dirname ${{ steps.mount_image.outputs.mount }}${repository_path})
+        case ${{ inputs.bind_mount_repository }} in
+        yes|true)
+            sudo mkdir -p ${{ steps.mount_image.outputs.mount }}${repository_path}
+            sudo mount --bind ${{ github.workspace }} ${{ steps.mount_image.outputs.mount }}${repository_path}
+        ;;
+        no|false)
+            sudo cp -Rp ${{ github.workspace }} ${{ steps.mount_image.outputs.mount }}${repository_path}
+        ;;
+        esac
+        if [ "${{ inputs.use_systemd_nspawn }}x" != "x" -a "${{ inputs.use_systemd_nspawn }}x" != "nox" ]; then
+            chroot_script_dir=/scripts
+            script_dir=${RUNNER_TEMP:-/home/actions/temp}/scripts
+        else
+            chroot_script_dir=/tmp
+            script_dir=${{ steps.mount_image.outputs.mount }}/tmp
+        fi
+        mkdir -p ${script_dir}
+        script_path=${script_dir}/commands.sh
+        touch ${script_path}
+        if [ "${debug}${exit_on_fail}" != "" ]; then
+            shell_basename=`basename ${shell_path}`
+            if [ "${shell_basename}" = "sh" -o "${shell_basename}" = "bash" -o "${shell_basename}" = "ksh" -o "${shell_package}" = "ksh" ]; then
+                echo "set -${debug}${exit_on_fail}" >> ${script_path}
+            fi
+        fi
+        case "${{ inputs.import_github_env }}" in
+        yes|true)
+            export | awk '/declare -x/ && !/=/ {next} {print}' | sed -e 's/^declare -x //g;s/='\''\(.*\)'\''$/=\1/g' >> ${script_dir}/environment.sh
+            echo ". ${chroot_script_dir}/environment.sh" >> ${script_path}
+        ;;
+        esac
+        case "${{ inputs.export_github_env }}" in
+        yes|true)
+            echo "GITHUB_ENV=${chroot_script_dir}/github_env.sh" >> ${script_path}
+        ;;
+        esac
+        echo "cd ${repository_path}" >> ${script_path}
+        cat >> ${script_path} <<"ARM_RUNNER_INPUT_COMMANDS_EOF"
+        ${{ inputs.commands }}
+        ARM_RUNNER_INPUT_COMMANDS_EOF
+        if [ "${{ inputs.use_systemd_nspawn }}x" != "x" -a "${{ inputs.use_systemd_nspawn }}x" != "nox" ]; then
+            sudo apt-get install -y systemd-container
+            sudo -E chroot  ${{ steps.mount_image.outputs.mount }} /bin/bash -c 'echo "runner ALL=(ALL:ALL) NOPASSWD:ALL" >> /etc/sudoers; groupadd docker; useradd -u 1001 --shell /bin/bash -rmUG docker,adm,systemd-journal runner'
+            sudo -E systemd-nspawn -q -a --user=runner --bind=${script_dir}:${chroot_script_dir} -D ${{ steps.mount_image.outputs.mount }} ${{ inputs.systemd_nspawn_options }} ${shell_path} ${shell_opts} ${chroot_script_dir}/commands.sh
+        else
+            sudo -E chroot  ${{ steps.mount_image.outputs.mount }} /bin/bash -c 'echo "runner ALL=(ALL:ALL) NOPASSWD:ALL" >> /etc/sudoers; groupadd docker; useradd -u 1001 --shell /bin/bash -rmUG docker,adm,systemd-journal runner'
+            sudo -E chroot --userspec=runner:docker --groups=docker,adm,systemd-journal ${{ steps.mount_image.outputs.mount }} ${shell_path} ${shell_opts} ${chroot_script_dir}/commands.sh
+        fi
+        rc=$?
+        [ -f ${script_dir}/github_env.sh ] && \
+            cat ${script_dir}/github_env.sh >> $GITHUB_ENV
+        exit $rc
+      shell: bash
+    - name: Copy artifacts within image
+      run: |
+        case "${{ inputs.debug }}" in
+        yes|true)
+            set -x
+        ;;
+        esac
+        repository_path=${{ inputs.copy_repository_path }}
+        if [ "${repository_path}x" = "x" ]; then
+            repository_name=`basename ${{ github.workspace }}`
+            repository_path=/${repository_name}
+        fi
+        if [ "${{ inputs.copy_artifact_path }}x" != "x" ] && [ "${{ inputs.copy_artifact_dest }}x" != "x" ]; then
+            while read -d\; copy_artifact_path; do
+                [ -z "${copy_artifact_path}" ] || sudo cp -Rp ${{ steps.mount_image.outputs.mount }}${repository_path}/${copy_artifact_path} ${{ inputs.copy_artifact_dest }}
+            done <<< "${{ inputs.copy_artifact_path }};"
+        fi
+      shell: bash
+    - name: Unmount CPU info
+      if: ${{ always() && inputs.cpu_info != '' }}
+      run: |
+        sudo umount ${{ steps.mount_image.outputs.mount }}/proc/cpuinfo
+      shell: bash
+    - name: Cleanup image
+      if: always()
+      run: |
+        case ${{ inputs.bind_mount_repository }} in
+        yes|true)
+            repository_path=${{ inputs.copy_repository_path }}
+            if [ "${repository_path}x" = "x" ]; then
+                repository_name=`basename ${{ github.workspace }}`
+                repository_path=/${repository_name}
+            fi
+            sudo umount ${{ steps.mount_image.outputs.mount }}${repository_path}
+        ;;
+        esac
+        sudo bash ${{ github.action_path }}/cleanup_image.sh ${{ steps.mount_image.outputs.loopdev }} ${{ steps.mount_image.outputs.mount }} ${{ steps.download_image.outputs.image }} "${{ inputs.optimize_image }}" "${{ inputs.rootpartition }}"
+      shell: bash
+branding:
+  icon: 'cpu'
+  color: 'purple'
