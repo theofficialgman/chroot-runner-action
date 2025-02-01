@@ -81,7 +81,7 @@ if [[ ! -f "${tempdir}/arm-runner.img" ]]; then
             7zr e *
         ;;
         *.xz)
-            xz -d *
+            xz -T0 -d *
         ;;
         *.gz)
             gzip -d *
@@ -95,7 +95,7 @@ if [[ ! -f "${tempdir}/arm-runner.img" ]]; then
             7zr e *
         ;;
         *.xz\?*)
-            xz -d *
+            xz -T0 -d *
         ;;
         *.gz\?*)
             gzip -d *
